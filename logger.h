@@ -1,222 +1,195 @@
-/* hyx_logger.h
- *
- * Copyright 2023 Michael Pollak. All rights reserved.
- */
+// <hyx/logger.h> -*- C++ -*-
+// Copyright (C) 2023  Michael Pollak
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 #ifndef HYX_LOGGER_H
 #define HYX_LOGGER_H
 
+#include <algorithm>
 #include <chrono>
-#include <concepts>
-#include <ctime>
 #include <filesystem>
 #include <format>
 #include <fstream>
+#include <hyx/header_string.h>
 #include <iostream>
+#include <iterator>
 #include <source_location>
 #include <stdexcept>
-#include <string.h>
+#include <string>
 #include <string_view>
 #include <syncstream>
 #include <type_traits>
 
 namespace hyx {
-    class logger {
-    private:
-        struct string_with_location {
-            std::string_view format;
-            std::source_location location;
-
-            template<typename T>
-                requires std::convertible_to<const T&, std::string_view>
-            consteval string_with_location(const T& fmt, const std::source_location& loc = std::source_location::current()) : format(fmt), location(loc)
-            {
-            }
-        };
-
-        // log level base type (using CRTP)
-        template<typename ConcreteLogLevel>
-        struct log_level_t {
-        public:
-            // we use string_with_location to get the caller's location through implicit conversion instead of the local location when header gets implicitly cast
-            template<typename... Args>
-            constexpr void operator()(const string_with_location& strwloc, Args&&... args) const
-            {
-                header(static_cast<ConcreteLogLevel>(*this), strwloc.location) << std::vformat(strwloc.format, std::make_format_args(args...)) << hyx::logger::emit;
-            }
-
-        protected:
-            // log_level_t needs to get inherited
-            log_level_t() = default;
-            log_level_t(const log_level_t&) = default;
-            log_level_t(log_level_t&&) = default;
-        };
-
-        template<typename ConcreteLogLevel>
-            requires std::derived_from<ConcreteLogLevel, log_level_t<ConcreteLogLevel>>
-        class log_function_guard {
-        public:
-            log_function_guard(const ConcreteLogLevel ll, const std::source_location& loc = std::source_location::current()) : log_level(ll), source_location(loc)
-            {
-                header(this->log_level, this->source_location) << this->source_location.function_name() << ": Start\n"
-                                                               << hyx::logger::emit;
-            }
-
-            log_function_guard(const log_function_guard&) = delete;
-            log_function_guard& operator=(const log_function_guard&) = delete;
-
-            ~log_function_guard()
-            {
-                header(this->log_level, this->source_location) << this->source_location.function_name() << ": End\n"
-                                                               << hyx::logger::emit;
-            }
-
-        private:
-            const ConcreteLogLevel log_level;
-            const std::source_location& source_location;
-        };
-
-        // log level types (using CRTP from log_level_t)
-        struct trace_t : public log_level_t<trace_t> {};
-        struct debug_t : public log_level_t<debug_t> {};
-        struct info_t : public log_level_t<info_t> {};
-        struct warning_t : public log_level_t<warning_t> {};
-        struct error_t : public log_level_t<error_t> {};
-        struct fatal_t : public log_level_t<fatal_t> {};
-
+    template<typename... Args>
+    struct format_string_with_location {
         template<typename T>
-            requires std::derived_from<T, log_level_t<T>>
-        struct log_level_to_string {
-            constexpr static auto value = []() {
-                // return a string literal for the given type
-                if constexpr (std::is_same_v<T, trace_t>) {
-                    return "TRACE";
-                }
-                else if constexpr (std::is_same_v<T, debug_t>) {
-                    return "DEBUG";
-                }
-                else if constexpr (std::is_same_v<T, info_t>) {
-                    return "INFO";
-                }
-                else if constexpr (std::is_same_v<T, warning_t>) {
-                    return "WARNING";
-                }
-                else if constexpr (std::is_same_v<T, error_t>) {
-                    return "ERROR";
-                }
-                else if constexpr (std::is_same_v<T, fatal_t>) {
-                    return "FATAL";
-                }
-                else {
-                    throw std::invalid_argument("Unknown log level");
-                }
-            }();
-        };
-
-        template<typename T>
-            requires std::derived_from<T, log_level_t<T>>
-        constexpr static auto log_level_to_string_v = log_level_to_string<T>::value;
-
-        class header {
-        private:
-            void create_header(const std::string_view level, const std::source_location& source)
-            {
-                // default header format
-                // --------------30--------------[----9----]: -?-@-?-: -?-
-                // utc[LEVEL]: source@line: prefix
-                *this << std::format("{:%FT%TZ}[{:^9}]: {}@{}: {}", std::chrono::utc_clock::now(), level, std::filesystem::path(source.file_name()).filename().string(), source.line(), logger::get_prefix());
-            }
-
-        public:
-            template<typename T>
-                requires std::derived_from<T, log_level_t<T>>
-            /*implicit*/ header(const T& log_level, const std::source_location& source = std::source_location::current())
-            {
-                create_header(log_level_to_string_v<std::remove_cvref_t<decltype(log_level)>>, source);
-            }
-        };
-
-    public:
-        // log level objects to access
-        trace_t trace;
-        debug_t debug;
-        info_t info;
-        warning_t warning;
-        error_t error;
-        fatal_t fatal;
-
-        // not copyable
-        logger(const logger& rhs) = delete;
-
-        ~logger();
-
-        void swap_to(const std::filesystem::path& logpath);
-
-        void swap_to(std::ostream& new_out_stream);
-
-        void push_prefix(const std::string_view pre);
-
-        void pop_prefix();
-
-        void disable();
-
-        void enable();
-
-        static std::string get_prefix()
+            requires std::convertible_to<const T&, std::format_string<Args...>>
+        consteval format_string_with_location(const T& s, const std::source_location& l = std::source_location::current()) : fstr(s), loc(l)
         {
-            return prefix;
         }
 
-        explicit logger(const std::filesystem::path& logpath);
-
-        explicit logger() {}
-
-        friend const header& operator<<(const header& head, const auto& out)
-        {
-            out_stream << out;
-            return head;
-        }
-
-        friend const header& operator<<(const header& head, const header& (*func)(const header&))
-        {
-            func(head);
-            return head;
-        }
-
-        friend const header& operator<<(const header& head, std::ostream& (*ostream_func)(std::ostream&))
-        {
-            ostream_func(out_stream);
-            return head;
-        }
-
-        static const header& emit(const header& head)
-        {
-            out_stream.emit();
-            return head;
-        }
-
-    private:
-        void open(const std::filesystem::path& log_path)
-        {
-            using namespace std::string_literals;
-
-            if (!std::filesystem::exists(log_path.parent_path()) && !std::filesystem::create_directories(log_path.parent_path())) {
-                throw std::runtime_error("Could not create log file @ "s + log_path.string());
-            }
-
-            // turn off buffering
-            fstream.rdbuf()->pubsetbuf(0, 0);
-            fstream.open(log_path, std::ios::app);
-        }
-
-        // TODO: do we need fstream here? can we create temp streams and hand them to out_stream?
-        std::ofstream fstream;
-        static std::osyncstream out_stream;
-        static std::string prefix;
+        std::format_string<Args...> fstr;
+        std::source_location loc;
     };
 
-    // external global logger
-    extern logger logger;
+    class log_level {
+    public:
+        consteval log_level(const std::string_view lbl) noexcept : label(lbl) {}
+
+        [[nodiscard]] auto to_string_view() const noexcept
+        {
+            return label;
+        }
+
+    private:
+        std::string_view label;
+    };
+
+    inline namespace logger_literals {
+        inline constinit static const log_level trace{"TRACE"};
+        inline constinit static const log_level debug{"DEBUG"};
+        inline constinit static const log_level info{"INFO"};
+        inline constinit static const log_level warning{"WARNING"};
+        inline constinit static const log_level error{"ERROR"};
+        inline constinit static const log_level fatal{"FATAL"};
+
+        inline consteval log_level operator""_lvl(const char* str, std::size_t len) noexcept
+        {
+            return {{str, len}};
+        }
+    } // namespace logger_literals
+
+    class logger {
+    public:
+        logger() noexcept = default;
+
+        // not copyable or movable
+        explicit logger(const logger&) = delete;
+        explicit logger(logger&&) = delete;
+        logger& operator=(const logger&) = delete;
+        logger& operator=(logger&&) = delete;
+
+        ~logger() = default;
+
+        template<typename... Args>
+        explicit logger(std::ostream& os, const header_string<std::type_identity_t<Args>...> fmt = "", Args&&... args) : sink_(os), header(std::format(fmt, std::forward<Args>(args)...)) {}
+
+        template<typename... Args>
+        explicit logger(std::ofstream& ofs, const header_string<std::type_identity_t<Args>...> fmt = "", Args&&... args) : sink_(ofs), header(std::format(fmt, std::forward<Args>(args)...)) {}
+
+        template<typename... Args>
+        explicit logger(const std::filesystem::path& path, const header_string<std::type_identity_t<Args>...> fmt = "", Args&&... args) : file_sink_(path, std::ios_base::app), sink_(file_sink_), header(std::format(fmt, std::forward<Args>(args)...))
+        {
+            if (path.filename().empty()) {
+                throw std::invalid_argument("log output path does not contain a filename");
+            }
+        }
+
+        template<typename... Args>
+        void operator()(const format_string_with_location<std::type_identity_t<Args>...>& fmt, Args&&... args)
+        {
+            logger::operator()(logger_literals::info, fmt, std::forward<Args>(args)...);
+        }
+
+        template<typename... Args>
+        void operator()(log_level lvl, const format_string_with_location<std::type_identity_t<Args>...>& fmt, Args&&... args)
+        {
+            // first output the header
+            format_scanner fc(header, std::ostream_iterator<char>(sink_), lvl, fmt.loc);
+            fc.scan();
+
+            // now we can output log-site data
+            sink_ << std::format(fmt.fstr, std::forward<Args>(args)...);
+
+            // we need both to ensure osyncstream outputs on each call
+            sink_.flush();
+            sink_.emit();
+        }
+
+        void disable()
+        {
+            sink_.setstate(std::ios::failbit);
+        }
+
+        void enable()
+        {
+            sink_.clear();
+        }
+
+    private:
+        template<typename OutIt>
+            requires(std::output_iterator<OutIt, const char&>)
+        class format_scanner : public basic_scanner {
+        public:
+            constexpr format_scanner(std::string_view fmt, OutIt out, log_level lvl, const std::source_location& sl) : basic_scanner(fmt), out_(out), lvl_(lvl), sl_(sl) {}
+
+        private:
+            OutIt out_;
+            log_level lvl_;
+            std::source_location sl_;
+
+            constexpr void on_event(iterator end) override
+            {
+                std::unique_copy(begin(), end, out_, [](auto a, auto b) { return (a == '[' && b == '[') || (a == ']' && b == ']'); });
+            }
+
+            constexpr void consume_spec(detail::spec_id id) override
+            {
+                const std::string_view fmt{"{:"s.append(std::string_view{ctx_.begin(), ctx_.subend()}).append("}")};
+
+                switch (id) {
+                    using enum hyx::detail::spec_id;
+                case lvl:
+                    std::vformat_to(out_, fmt, std::make_format_args(lvl_.to_string_view()));
+                    break;
+                case sys:
+                    std::vformat_to(out_, fmt, std::make_format_args(std::chrono::system_clock::now()));
+                    break;
+                case utc:
+                    std::vformat_to(out_, fmt, std::make_format_args(std::chrono::utc_clock::now()));
+                    break;
+                case tai:
+                    std::vformat_to(out_, fmt, std::make_format_args(std::chrono::tai_clock::now()));
+                    break;
+                case gps:
+                    std::vformat_to(out_, fmt, std::make_format_args(std::chrono::gps_clock::now()));
+                    break;
+                case file:
+                    std::vformat_to(out_, fmt, std::make_format_args(std::chrono::file_clock::now()));
+                    break;
+                case line:
+                    std::vformat_to(out_, fmt, std::make_format_args(sl_.line()));
+                    break;
+                case column:
+                    std::vformat_to(out_, fmt, std::make_format_args(sl_.column()));
+                    break;
+                case file_name:
+                    std::vformat_to(out_, fmt, std::make_format_args(sl_.file_name()));
+                    break;
+                case function_name:
+                    std::vformat_to(out_, fmt, std::make_format_args(sl_.function_name()));
+                    break;
+                }
+            }
+        };
+
+        std::ofstream file_sink_{};
+        std::osyncstream sink_{std::clog};
+        std::string header;
+    };
 } // namespace hyx
 
 #endif // !HYX_LOGGER_H
